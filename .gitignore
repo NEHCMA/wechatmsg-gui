@@ -1,0 +1,63 @@
+# ===== 系统 / 编辑器 =====
+.vscode
+.idea
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ===== Python 虚拟环境 =====
+.venv/
+venv/
+venv_decrypt/
+venv_main_pc/
+
+# ===== 构建产物 =====
+build/
+dist/
+*.spec
+*.pyd
+*.dll
+
+# ===== 敏感数据：解密后的数据库与密钥，绝不提交 =====
+wxid_*/
+keys/
+_tools/
+data/
+*.db
+*.bin
+*.json
+
+# ===== 本项目运行产物（含聊天明文与图片，绝不提交）=====
+decrypted_output/
+exports/
+extracted/
+extracted2/
+_img_out/
+_test_export_out/
+_e2e/
+_nbimg/
+_dat_index.json
+
+# ===== 运行日志 =====
+*.log
+日志文件-*.log
+_run.log
+_gui_error.log
+
+# ===== 本地记忆与临时文件 =====
+.workbuddy/
+test*
+*.ui
+
+# ===== 上游遗留路径（本仓库不会用到）=====
+sqlcipher-3.0.1
+server
+app/data/avatar
+app/data/image2
+app/data/emoji
+app/DataBase/Msg/*
+wordcloud.html
+
+# ===== 需要保留的构建文件（覆盖上面的通配规则）=====
+!requirements.txt
+!start.bat
