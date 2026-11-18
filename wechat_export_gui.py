@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import time
+import queue
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -23,6 +24,8 @@ import importlib.util
 import subprocess
 from PIL import Image, ImageTk
 import io
+
+import ui_kit
 
 # Add the parent directory to the path to import the required modules
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -104,15 +107,23 @@ class WeChatExportGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("微信记录导出工具")
-        self.root.geometry("800x600")
-        self.root.minsize(800, 600)
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win_w = min(1240, max(1000, sw - 80))
+        win_h = min(820, max(660, sh - 140))
+        self.root.geometry(f"{win_w}x{win_h}")
+        self.root.minsize(min(1000, win_w), min(640, win_h))
+        self.root.configure(bg=ui_kit.COLORS["bg"])
 
-        # 导入配置模块
+        # 主题与 ttk 样式
+        self.C = ui_kit.COLORS
+        self.F = ui_kit.FONTS
+        ui_kit.setup_ttk_styles(root)
+
+        # 配置
         try:
             import config
             self.config = config.load_config()
         except ImportError:
-            # 如果配置模块不存在，使用默认值
             self.config = {
                 "db_dir": "",
                 "db_version": 3,
@@ -123,143 +134,113 @@ class WeChatExportGUI:
             }
             self.log_message_console("未找到配置模块，使用默认配置")
 
-        # Create custom styles
-        self.create_custom_styles()
+        # 运行状态
+        self.database = None
+        self.contacts = []
+        self.filtered_contacts = []
+        self.load_button = None
+        self.test_button = None
+        self._contact = None
+        self._selected_row = None
+        self._search_job = None
 
-        # Create variables
+        # 头像流水线：唯一后台 worker + 主线程分帧应用
+        self.contact_avatar_cache = {}
+        self._avatar_gen = 0
+        self._avatar_todo = queue.Queue()
+        self._avatar_done = queue.Queue()
+        self._avatar_worker_started = False
+        self._avatar_pump_job = None
+        self._avatar_pending = set()
+        self._avatar_missing = set()
+        self._placeholder_avatars = {}
+
+        # 日志流水线：跨线程安全 + 合并刷新，避免每行都重绘
+        self._log_queue = queue.Queue()
+        self._log_job = None
+
+        # 变量
         self.db_dir = tk.StringVar()
         self.db_version = tk.IntVar(value=self.config.get("db_version", 3))
         self.output_dir = tk.StringVar(value=self.config.get("output_dir", "./data/"))
         self.selected_wxid = tk.StringVar()
         self.search_text = tk.StringVar()
         self.search_text.trace("w", self.filter_contacts)
-
-        # 如果配置中有数据库目录，设置它
         if self.config.get("db_dir"):
             self.db_dir.set(self.config.get("db_dir"))
 
-        # Create main notebook (tabbed interface)
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # 页面骨架
+        self._build_header()
+        self.notebook = ui_kit.TabBar(root, on_change=self._on_tab_change)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Initialize database connection and other variables
-        self.database = None
-        self.contacts = []
-        self.filtered_contacts = []
-        self.load_button = None
-
-        # 创建主要标签页
-        self.create_contacts_tab()  # 联系人管理 (主界面)
-        self.create_settings_tab()  # 设置
-
-        # 如果周报生成模块可用，创建周报生成标签页
+        self.create_contacts_tab()
+        self.create_settings_tab()
         if WeeklyReportFrame is not None:
-            self.create_weekly_report_tab()  # 周报生成
+            self.create_weekly_report_tab()
 
-        # Status bar
-        self.status_var = tk.StringVar(value="就绪")
-        self.status_bar = ttk.Label(root, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self._build_status_bar()
+        self._start_log_pump()
 
-        # 如果配置中有数据库目录，自动尝试连接
+        self.root.after(80, lambda: ui_kit.apply_dark_titlebar(self.root))
+
         if self.config.get("db_dir") and os.path.exists(self.config.get("db_dir")):
-            self.root.after(1000, lambda: self.load_contacts(auto=True))
+            self.root.after(800, lambda: self.load_contacts(auto=True))
 
-        # 初始化联系人头像缓存
-        self.contact_avatar_cache = {}
+    def _build_header(self):
+        """顶部品牌栏：渐变底 + 徽标 + 状态药丸"""
+        C, F = self.C, self.F
+        self._header = tk.Canvas(self.root, height=64, bg=C["bg"],
+                                 highlightthickness=0, bd=0)
+        self._header.pack(fill=tk.X)
+
+        def draw(_event=None):
+            c = self._header
+            w = c.winfo_width() or 1240
+            h = 64
+            c.delete("all")
+            # 底部一条细分隔线，取代顶部渐变条
+            c.create_line(0, h - 1, w, h - 1, fill=C["border_soft"])
+
+            x0 = 24
+            # 简洁徽标：圆角方块 + 单字，不再用花哨渐变
+            ui_kit.round_rect(c, x0, 18, x0 + 28, 46, 8, fill=C["accent"], outline="")
+            c.create_text(x0 + 14, 32, text="微", fill="#FFFFFF", font=F["h2"])
+            c.create_text(x0 + 40, 32, text="微信记录导出", fill=C["text"],
+                          font=F["display"], anchor="w")
+
+            connected = self.database is not None
+            label = "● 已连接" if connected else "● 未连接"
+            color = C["green"] if connected else C["amber"]
+            bw = 88
+            ui_kit.round_rect(c, w - 24 - bw, 20, w - 24, 44, 12,
+                              fill=C["surface"], outline=C["border"])
+            c.create_text(w - 24 - bw / 2, 32, text=label, fill=color, font=F["small"])
+
+        self._header.bind("<Configure>", draw)
+        self._header_refresh = draw
+
+    def _build_status_bar(self):
+        C, F = self.C, self.F
+        bar = tk.Frame(self.root, bg=C["bg_soft"], height=28)
+        bar.pack(fill=tk.X, side=tk.BOTTOM)
+        bar.pack_propagate(False)
+        self.status_var = tk.StringVar(value="就绪")
+        tk.Label(bar, textvariable=self.status_var, bg=C["bg_soft"],
+                 fg=C["muted"], font=F["tiny"]).pack(side=tk.LEFT, padx=18)
+        self.status_right = tk.StringVar(value="")
+        tk.Label(bar, textvariable=self.status_right, bg=C["bg_soft"],
+                 fg=C["faint"], font=F["tiny"]).pack(side=tk.RIGHT, padx=18)
+
+    def _on_tab_change(self, frame=None):
+        if getattr(self, "_weekly_tab", None) is frame:
+            self._ensure_weekly_built()
+        if getattr(self, "vlist", None) is not None:
+            self.root.after_idle(self.vlist._schedule_render)
 
     def create_custom_styles(self):
-        """Create custom styles for widgets"""
-        style = ttk.Style()
-
-        # Create a custom style for accent buttons
-        style.configure(
-            "Accent.TButton",
-            font=("Helvetica", 10, "bold"),
-            background="#4CAF50",
-            foreground="#ffffff"
-        )
-
-        # Create a custom style for disabled buttons
-        style.configure(
-            "Disabled.TButton",
-            font=("Helvetica", 10),
-            background="#cccccc",
-            foreground="#888888"
-        )
-
-        # 创建微信风格的样式
-        style.configure(
-            "WeChat.TLabelframe",
-            background="#f5f5f5",
-            borderwidth=0
-        )
-
-        style.configure(
-            "WeChat.TFrame",
-            background="#f5f5f5"
-        )
-
-        style.configure(
-            "WeChat.TLabel",
-            background="#f5f5f5",
-            font=("微软雅黑", 9)
-        )
-
-        style.configure(
-            "WeChat.Search.TEntry",
-            fieldbackground="#e6e6e6",
-            bordercolor="#e6e6e6",
-            lightcolor="#e6e6e6",
-            darkcolor="#e6e6e6",
-            borderwidth=1
-        )
-
-        style.configure(
-            "WeChat.Contacts.TFrame",
-            background="#ffffff"
-        )
-
-        # 自定义联系人项目样式
-        style.configure(
-            "Contact.TFrame",
-            background="#ffffff"
-        )
-
-        style.configure(
-            "Contact.TLabel",
-            background="#ffffff",
-            font=("微软雅黑", 9)
-        )
-
-        # 联系人悬停效果样式
-        style.configure(
-            "ContactHover.TFrame",
-            background="#f0f0f0"
-        )
-
-        style.configure(
-            "ContactHover.TLabel",
-            background="#f0f0f0",
-            font=("微软雅黑", 9)
-        )
-
-        # 微信绿色按钮样式，确保文字颜色能清晰显示
-        style.configure(
-            "WeChat.TButton",
-            background="#07c160",
-            foreground="#000000",  # 白色文字
-            font=("微软雅黑", 9, "bold"),  # 加粗字体增加可读性
-            padding=(10, 5)  # 增加内边距
-        )
-
-        # 映射按钮的不同状态效果
-        style.map(
-            "WeChat.TButton",
-            background=[("active", "#06ae56"), ("!active", "#07c160")],  # 活动状态稍暗
-            foreground=[("active", "#000000"), ("!active", "#000000")],
-            relief=[("pressed", "sunken"), ("!pressed", "raised")]  # 按下时凹陷效果
-        )
+        """沿用旧方法名，实际交给 ui_kit 统一配置"""
+        ui_kit.setup_ttk_styles(self.root)
 
     def create_decrypt_tab(self):
         """Create the database decryption tab"""
@@ -286,296 +267,255 @@ class WeChatExportGUI:
         self.decrypt_log.config(state=tk.DISABLED)
 
     def create_contacts_tab(self):
-        """Create the contacts management tab"""
-        contacts_tab = ttk.Frame(self.notebook, style="WeChat.TFrame")
-        self.notebook.add(contacts_tab, text="联系人管理")
+        """联系人管理页：左侧数据源 + 虚拟列表，右侧详情 + 导出"""
+        C, F = self.C, self.F
+        tab = tk.Frame(self.notebook, bg=C["bg"])
+        self.notebook.add(tab, text="联系人管理")
 
-        # 创建左右分栏的布局
-        paned_window = ttk.PanedWindow(contacts_tab, orient=tk.HORIZONTAL)
-        paned_window.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)
+        wrap = tk.Frame(tab, bg=C["bg"])
+        wrap.pack(fill=tk.BOTH, expand=True, padx=18, pady=12)
 
-        # 左侧面板 - 数据库设置和联系人列表
-        left_panel = ttk.Frame(paned_window, style="WeChat.TFrame")
-        paned_window.add(left_panel, weight=2)
+        # ------------------------------------------------ 左列
+        left = tk.Frame(wrap, bg=C["bg"], width=430)
+        left.pack(side=tk.LEFT, fill=tk.Y)
+        left.pack_propagate(False)
 
-        # 右侧面板 - 联系人详情和导出功能
-        right_panel = ttk.Frame(paned_window, style="WeChat.TFrame")
-        paned_window.add(right_panel, weight=3)
+        card = ui_kit.Card(left, title="数据源", subtitle="已解密的数据库目录", accent_left=True)
+        card.pack(fill=tk.X)
+        body = card.body
 
-        # 数据库设置区域
-        db_frame = ttk.LabelFrame(left_panel, text="数据库设置", style="WeChat.TLabelframe")
-        db_frame.pack(fill=tk.X, padx=10, pady=10)
+        tk.Label(body, text="数据库目录", bg=C["surface"], fg=C["muted"],
+                 font=F["tiny"]).pack(anchor="w")
+        row = tk.Frame(body, bg=C["surface"])
+        row.pack(fill=tk.X, pady=(4, 10))
+        ttk.Entry(row, textvariable=self.db_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ui_kit.PillButton(row, text="浏览", height=31, width=62, bg=C["surface"],
+                          command=self.browse_db_dir).pack(side=tk.LEFT, padx=(8, 0))
 
-        # 数据库目录选择
-        ttk.Label(db_frame, text="数据库目录:", style="WeChat.TLabel").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(db_frame, textvariable=self.db_dir, width=30).grid(row=0, column=1, padx=5, pady=5, sticky=tk.W+tk.E)
-        ttk.Button(db_frame, text="浏览...", command=self.browse_db_dir).grid(row=0, column=2, padx=5, pady=5)
-
-        # 数据库版本选择
-        version_frame = ttk.Frame(db_frame, style="WeChat.TFrame")
-        version_frame.grid(row=1, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W+tk.E)
-
-        ttk.Label(version_frame, text="数据库版本:", style="WeChat.TLabel").pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(version_frame, text="微信 3.x", variable=self.db_version, value=3).pack(side=tk.LEFT, padx=15)
-        ttk.Radiobutton(version_frame, text="微信 4.0 / 4.1", variable=self.db_version, value=4).pack(side=tk.LEFT, padx=15)
-
-        # 按钮区域
-        button_frame = ttk.Frame(db_frame, style="WeChat.TFrame")
-        button_frame.grid(row=2, column=0, columnspan=3, padx=5, pady=10)
+        ver = tk.Frame(body, bg=C["surface"])
+        ver.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(ver, text="版本", bg=C["surface"], fg=C["muted"],
+                 font=F["tiny"]).pack(side=tk.LEFT, padx=(0, 6))
+        for txt, val in (("微信 3.x", 3), ("微信 4.x", 4)):
+            ttk.Radiobutton(ver, text=txt, value=val,
+                            variable=self.db_version).pack(side=tk.LEFT, padx=(6, 0))
 
         self.load_status_var = tk.StringVar(value="")
-        load_status_label = ttk.Label(button_frame, textvariable=self.load_status_var, foreground="blue", style="WeChat.TLabel")
-        load_status_label.pack(pady=2)
+        tk.Label(body, textvariable=self.load_status_var, bg=C["surface"],
+                 fg=C["accent"], font=F["tiny"]).pack(anchor="w", pady=(0, 6))
 
-        button_container = ttk.Frame(button_frame, style="WeChat.TFrame")
-        button_container.pack(fill=tk.X, pady=5)
+        btns = tk.Frame(body, bg=C["surface"])
+        btns.pack(fill=tk.X)
+        self.load_button = ui_kit.PillButton(btns, text="加载联系人", kind="ghost",
+                                             height=36, bg=C["surface"],
+                                             command=self.load_contacts)
+        self.load_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.test_button = ui_kit.PillButton(btns, text="测试", kind="ghost",
+                                             height=36, width=72, bg=C["surface"],
+                                             command=self.test_database_connection)
+        self.test_button.pack(side=tk.LEFT, padx=(8, 0))
 
-        self.load_button = ttk.Button(
-            button_container,
-            text="加载联系人",
-            command=self.load_contacts,
-            style="WeChat.TButton"
-        )
-        self.load_button.pack(side=tk.LEFT, padx=5, ipadx=10, ipady=5, expand=True, fill=tk.X)
+        # 统计徽章（常驻，只更新数字，避免每次筛选重建控件）
+        self.stats_row = tk.Frame(left, bg=C["bg"])
+        self.stats_row.pack(fill=tk.X, pady=(12, 8))
+        self._stat_vars = {}
+        # 数字用主文字色、标签用灰，不抢主操作（绿色）的注意力
+        for name in ("好友", "群聊", "公众号", "星标"):
+            chip = tk.Frame(self.stats_row, bg=C["surface"], highlightthickness=1,
+                            highlightbackground=C["border"])
+            chip.pack(side=tk.LEFT, padx=(0, 6))
+            var = tk.StringVar(value="0")
+            self._stat_vars[name] = var
+            tk.Label(chip, textvariable=var, bg=C["surface"], fg=C["text"],
+                     font=F["h2"]).pack(side=tk.LEFT, padx=(8, 4), pady=2)
+            tk.Label(chip, text=name, bg=C["surface"], fg=C["muted"],
+                     font=F["tiny"]).pack(side=tk.LEFT, padx=(0, 8))
 
-        self.test_button = ttk.Button(
-            button_container,
-            text="测试连接",
-            command=self.test_database_connection
-        )
-        self.test_button.pack(side=tk.LEFT, padx=5, ipadx=10, ipady=5, expand=True, fill=tk.X)
+        # 搜索
+        ui_kit.SearchBox(left, self.search_text).pack(fill=tk.X, pady=(0, 8))
 
-        # 联系人列表区域
-        contacts_container = ttk.Frame(left_panel, style="WeChat.TFrame")
-        contacts_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        # 虚拟列表
+        list_card = ui_kit.Card(left, pad=10)
+        list_card.pack(fill=tk.BOTH, expand=True)
+        self.vlist = ui_kit.VirtualList(list_card.body,
+                                        on_select=self._on_contact_select,
+                                        avatar_hook=self._request_avatar)
+        self.vlist.pack(fill=tk.BOTH, expand=True)
 
-        # 搜索框 - 微信风格
-        search_frame = ttk.Frame(contacts_container, style="WeChat.TFrame")
-        search_frame.pack(fill=tk.X, padx=0, pady=5)
+        # ------------------------------------------------ 右列
+        right = tk.Frame(wrap, bg=C["bg"])
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(16, 0))
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)   # 日志区吃掉剩余高度
 
-        search_container = ttk.Frame(search_frame, style="WeChat.TFrame")
-        search_container.pack(fill=tk.X, pady=5, padx=5)
-        search_container.configure(borderwidth=1, relief="solid")
+        # 详情卡
+        dcard = ui_kit.Card(right, pad=12)
+        dcard.grid(row=0, column=0, sticky="ew")
+        head = tk.Frame(dcard.body, bg=C["surface"])
+        head.pack(fill=tk.X)
 
-        search_icon = ttk.Label(search_container, text="🔍", style="WeChat.TLabel")
-        search_icon.pack(side=tk.LEFT, padx=5)
+        # 详情头像：与列表一致，圆形首字占位（空态隐藏）
+        self.detail_avatar = tk.Label(head, text="", bg=C["surface2"], fg=C["text_dim"],
+                                      font=F["h2"], width=3, height=1)
+        self.detail_avatar.pack(side=tk.LEFT, padx=(0, 14))
 
-        search_entry = ttk.Entry(
-            search_container,
-            textvariable=self.search_text,
-            font=("微软雅黑", 9),
-            style="WeChat.Search.TEntry",
-            width=25
-        )
-        search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, ipady=5, padx=5)
+        head_text = tk.Frame(head, bg=C["surface"])
+        head_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.detail_name = tk.Label(head_text, text="未选择联系人", bg=C["surface"],
+                                    fg=C["text"], font=F["h1"], anchor="w")
+        self.detail_name.pack(fill=tk.X)
+        self.detail_wxid = tk.Label(head_text, text="从左侧列表选择一位联系人或群聊",
+                                    bg=C["surface"], fg=C["muted"],
+                                    font=F["tiny"], anchor="w")
+        self.detail_wxid.pack(fill=tk.X, pady=(2, 0))
 
-        # 联系人列表容器（使用Canvas和Scrollbar创建可滚动区域）
-        contacts_list_frame = ttk.Frame(contacts_container, style="WeChat.TFrame")
-        contacts_list_frame.pack(fill=tk.BOTH, expand=True, padx=0, pady=5)
+        # 类型徽章：空态不显示（避免孤立方块）
+        self.detail_badge = tk.Label(head, text="", bg=C["surface2"], fg=C["muted"],
+                                     font=F["tiny"], padx=10, pady=3)
 
-        # 创建滚动条
-        scrollbar = ttk.Scrollbar(contacts_list_frame)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # 创建Canvas用于滚动
-        contacts_canvas = tk.Canvas(contacts_list_frame,
-                                   bg="#ffffff",
-                                   highlightthickness=0,
-                                   yscrollcommand=scrollbar.set)
-        contacts_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # 绑定滚动条与Canvas
-        scrollbar.config(command=contacts_canvas.yview)
-
-        # 创建一个框架放在Canvas中，用于存放所有联系人项目
-        self.contacts_frame = ttk.Frame(contacts_canvas, style="WeChat.Contacts.TFrame")
-        contacts_canvas.create_window((0, 0), window=self.contacts_frame, anchor=tk.NW, tags="self.contacts_frame")
-
-        # 设置Canvas滚动区域
-        def _configure_canvas(event):
-            contacts_canvas.configure(scrollregion=contacts_canvas.bbox("all"), width=event.width)
-
-        self.contacts_frame.bind("<Configure>", _configure_canvas)
-
-        # 鼠标滚轮绑定
-        def _on_mousewheel(event):
-            contacts_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-
-        contacts_canvas.bind_all("<MouseWheel>", _on_mousewheel)
-
-        # ========== 右侧面板 - 联系人详情和导出功能 ==========
-
-        # 联系人详情
-        details_frame = ttk.LabelFrame(right_panel, text="联系人详情", style="WeChat.TLabelframe")
-        details_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        # 联系人信息头部
-        contact_header = ttk.Frame(details_frame, style="WeChat.TFrame")
-        contact_header.pack(fill=tk.X, padx=10, pady=10)
-
-        # 头像占位符 - 修改为可存储图像的标签
-        self.avatar_label = ttk.Label(contact_header, text="👤", font=("Arial", 36), style="WeChat.TLabel")
-        self.avatar_label.pack(side=tk.LEFT, padx=10)
-
-        # 联系人基本信息
-        contact_info = ttk.Frame(contact_header, style="WeChat.TFrame")
-        contact_info.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10)
-
-        ttk.Label(contact_info, text="选中的联系人:", style="WeChat.TLabel").pack(anchor=tk.W, pady=2)
-        ttk.Entry(contact_info, textvariable=self.selected_wxid, state="readonly", width=30).pack(anchor=tk.W, pady=2, fill=tk.X)
-
-        # 详细信息
-        self.contact_details = scrolledtext.ScrolledText(
-            details_frame,
-            wrap=tk.WORD,
-            height=10,
-            font=("微软雅黑", 9),
-            background="#ffffff",
-            borderwidth=0
-        )
-        self.contact_details.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        detail_box = tk.Frame(dcard.body, bg=C["surface2"])
+        detail_box.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        self.contact_details = tk.Text(detail_box, height=4, wrap=tk.WORD,
+                                       bg=C["surface2"], fg=C["muted"], bd=0,
+                                       highlightthickness=0, padx=12, pady=8,
+                                       font=F["small"], insertbackground=C["accent"])
+        detail_vsb = ttk.Scrollbar(detail_box, orient=tk.VERTICAL,
+                                   style="Slim.Vertical.TScrollbar",
+                                   command=self.contact_details.yview)
+        self.contact_details.configure(yscrollcommand=detail_vsb.set)
+        detail_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.contact_details.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.contact_details.config(state=tk.DISABLED)
 
-        # 添加导出功能区
-        export_frame = ttk.LabelFrame(right_panel, text="导出设置", style="WeChat.TLabelframe")
-        export_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # 导出卡
+        ecard = ui_kit.Card(right, title="导出设置", accent_left=True)
+        ecard.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        eb = ecard.content
+        eb.columnconfigure(1, weight=1)
 
-        # 输出目录
-        ttk.Label(export_frame, text="输出目录:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-        ttk.Entry(export_frame, textvariable=self.output_dir, width=50).grid(row=0, column=1, padx=5, pady=5)
-        ttk.Button(export_frame, text="浏览...", command=self.browse_output_dir).grid(row=0, column=2, padx=5, pady=5)
+        tk.Label(eb, text="输出目录", bg=C["surface"], fg=C["muted"],
+                 font=F["tiny"]).grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        outrow = tk.Frame(eb, bg=C["surface"])
+        outrow.grid(row=0, column=1, columnspan=2, sticky="ew", pady=4)
+        ttk.Entry(outrow, textvariable=self.output_dir).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ui_kit.PillButton(outrow, text="浏览", height=31, width=62, bg=C["surface"],
+                          command=self.browse_output_dir).pack(side=tk.LEFT, padx=(8, 0))
 
-        # 导出格式
-        ttk.Label(export_frame, text="导出格式:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-        self.format_combobox = ttk.Combobox(export_frame, values=["HTML", "TXT", "AI_TXT", "DOCX", "MARKDOWN", "XLSX"])
-        self.format_combobox.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
-        self.format_combobox.current(0)  # Default to HTML
+        tk.Label(eb, text="导出格式", bg=C["surface"], fg=C["muted"],
+                 font=F["tiny"]).grid(row=1, column=0, sticky="w", padx=(0, 10), pady=4)
+        self.format_combobox = ttk.Combobox(eb, values=["HTML", "TXT", "AI_TXT", "DOCX",
+                                                        "MARKDOWN", "XLSX"], state="readonly")
+        self.format_combobox.grid(row=1, column=1, sticky="w", pady=4)
+        last_fmt = self.config.get("last_export_format", "HTML")
+        if last_fmt in self.format_combobox["values"]:
+            self.format_combobox.set(last_fmt)
+        else:
+            self.format_combobox.current(0)
 
-        # 时间范围
-        time_frame = ttk.LabelFrame(export_frame, text="时间范围")
-        time_frame.grid(row=2, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W+tk.E)
+        split = tk.Frame(eb, bg=C["surface"])
+        split.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(6, 4))
+        split.columnconfigure(0, weight=0)
+        split.columnconfigure(1, weight=1)
 
-        # 替换原始的输入框为日历选择器
-        try:
-            from tkcalendar import DateEntry
+        time_col = tk.Frame(split, bg=C["surface"])
+        time_col.grid(row=0, column=0, sticky="nw")
+        tk.Label(time_col, text="时间范围", bg=C["surface"], fg=C["muted"],
+                 font=F["tiny"]).pack(anchor="w")
+        self._build_time_range(time_col)
 
-            ttk.Label(time_frame, text="开始时间:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
+        types_col = tk.Frame(split, bg=C["surface"])
+        types_col.grid(row=0, column=1, sticky="nw", padx=(24, 0))
+        tk.Label(types_col, text="消息类型", bg=C["surface"], fg=C["muted"],
+                 font=F["tiny"]).pack(anchor="w")
+        types_grid = tk.Frame(types_col, bg=C["surface"])
+        types_grid.pack(anchor="w", pady=(2, 0))
+        self._build_message_types(types_grid)
 
-            # 使用DateEntry替代普通Entry
-            self.start_date_entry = DateEntry(time_frame, width=18,
-                                    background='darkblue', foreground='white',
-                                    borderwidth=2,
-                                    date_pattern='yyyy-mm-dd',
-                                    year=2020, month=1, day=1)
-            self.start_date_entry.grid(row=0, column=1, padx=5, pady=5)
-
-            # 添加时间选择
-            time_frame1 = ttk.Frame(time_frame)
-            time_frame1.grid(row=0, column=2, padx=(0, 5), pady=5)
-            self.start_hour = ttk.Spinbox(time_frame1, from_=0, to=23, width=3, format="%02.0f")
-            self.start_hour.set("00")
-            self.start_hour.pack(side=tk.LEFT)
-            ttk.Label(time_frame1, text=":").pack(side=tk.LEFT)
-            self.start_minute = ttk.Spinbox(time_frame1, from_=0, to=59, width=3, format="%02.0f")
-            self.start_minute.set("00")
-            self.start_minute.pack(side=tk.LEFT)
-            ttk.Label(time_frame1, text=":").pack(side=tk.LEFT)
-            self.start_second = ttk.Spinbox(time_frame1, from_=0, to=59, width=3, format="%02.0f")
-            self.start_second.set("00")
-            self.start_second.pack(side=tk.LEFT)
-
-            ttk.Label(time_frame, text="结束时间:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
-
-            # 使用DateEntry替代普通Entry
-            self.end_date_entry = DateEntry(time_frame, width=18,
-                                    background='darkblue', foreground='white',
-                                    borderwidth=2,
-                                    date_pattern='yyyy-mm-dd',
-                                    year=2035, month=12, day=31)
-            self.end_date_entry.grid(row=1, column=1, padx=5, pady=5)
-
-            # 添加时间选择
-            time_frame2 = ttk.Frame(time_frame)
-            time_frame2.grid(row=1, column=2, padx=(0, 5), pady=5)
-            self.end_hour = ttk.Spinbox(time_frame2, from_=0, to=23, width=3, format="%02.0f")
-            self.end_hour.set("23")
-            self.end_hour.pack(side=tk.LEFT)
-            ttk.Label(time_frame2, text=":").pack(side=tk.LEFT)
-            self.end_minute = ttk.Spinbox(time_frame2, from_=0, to=59, width=3, format="%02.0f")
-            self.end_minute.set("59")
-            self.end_minute.pack(side=tk.LEFT)
-            ttk.Label(time_frame2, text=":").pack(side=tk.LEFT)
-            self.end_second = ttk.Spinbox(time_frame2, from_=0, to=59, width=3, format="%02.0f")
-            self.end_second.set("59")
-            self.end_second.pack(side=tk.LEFT)
-
-        except ImportError:
-            # 如果tkcalendar不可用，回退到普通的输入框
-            ttk.Label(time_frame, text="开始时间:").grid(row=0, column=0, padx=5, pady=5, sticky=tk.W)
-            self.start_time_entry = ttk.Entry(time_frame, width=20)
-            self.start_time_entry.grid(row=0, column=1, padx=5, pady=5)
-            self.start_time_entry.insert(0, "2020-01-01 00:00:00")
-
-            ttk.Label(time_frame, text="结束时间:").grid(row=0, column=2, padx=5, pady=5, sticky=tk.W)
-            self.end_time_entry = ttk.Entry(time_frame, width=20)
-            self.end_time_entry.grid(row=0, column=3, padx=5, pady=5)
-            self.end_time_entry.insert(0, "2035-12-31 23:59:59")
-
-        # 消息类型选择
-        types_frame = ttk.LabelFrame(export_frame, text="消息类型")
-        types_frame.grid(row=3, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W+tk.E)
-
-        self.msg_types = {}
-        msg_type_values = [
-            ("文本消息", MessageType.Text),
-            ("图片消息", MessageType.Image),
-            ("语音消息", MessageType.Audio),
-            ("视频消息", MessageType.Video),
-            ("链接消息", MessageType.LinkMessage),
-            ("表情消息", MessageType.Emoji),
-            ("文件消息", MessageType.File),
-            ("系统消息", MessageType.System),
-            ("引用消息", MessageType.Quote),
-            ("合并转发消息", MessageType.MergedMessages),
-            ("全部消息", None)
-        ]
-
-        row, col = 0, 0
-        for text, value in msg_type_values:
-            var = tk.BooleanVar(value=True if value is None else False)
-            self.msg_types[value] = var
-            cb = ttk.Checkbutton(types_frame, text=text, variable=var)
-            cb.grid(row=row, column=col, padx=5, pady=2, sticky=tk.W)
-            col += 1
-            if col > 2:
-                col = 0
-                row += 1
-
-        # 导出按钮
-        ttk.Button(export_frame, text="开始导出", command=self.start_export, style="WeChat.TButton").grid(row=4, column=0, columnspan=3, padx=5, pady=10, sticky=tk.W+tk.E)
-
-        # 进度条
         self.progress_var = tk.DoubleVar()
-        self.progress_bar = ttk.Progressbar(export_frame, variable=self.progress_var, maximum=100)
-        self.progress_bar.grid(row=5, column=0, columnspan=3, padx=5, pady=5, sticky=tk.W+tk.E)
+        self.progress_bar = ttk.Progressbar(eb, variable=self.progress_var, maximum=100)
+        self.progress_bar.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 6))
 
-        # 导出日志
-        log_frame = ttk.LabelFrame(right_panel, text="操作日志", style="WeChat.TLabelframe")
-        log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        self.export_button = ui_kit.PillButton(eb, text="开始导出", kind="primary",
+                                               height=38, bg=C["surface"],
+                                               font=F["h1"], command=self.start_export)
+        self.export_button.grid(row=4, column=0, columnspan=3, sticky="ew")
 
-        self.contacts_log = scrolledtext.ScrolledText(
-            log_frame,
-            wrap=tk.WORD,
-            height=8,
-            font=("微软雅黑", 9),
-            background="#ffffff",
-            borderwidth=0
-        )
-        self.contacts_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 日志卡
+        lcard = ui_kit.Card(right, pad=12)
+        lcard.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        lhead = tk.Frame(lcard.body, bg=C["surface"])
+        lhead.pack(fill=tk.X, pady=(0, 6))
+        tk.Label(lhead, text="运行日志", bg=C["surface"], fg=C["text"],
+                 font=F["h2"]).pack(side=tk.LEFT)
+        ui_kit.PillButton(lhead, text="清空", kind="ghost", height=24, width=56,
+                          bg=C["surface"], font=F["tiny"],
+                          command=self._clear_log).pack(side=tk.RIGHT)
+
+        self.contacts_log = tk.Text(lcard.body, height=2, wrap=tk.WORD,
+                                    bg=C["surface2"], fg=C["text_dim"], bd=0,
+                                    highlightthickness=0, padx=12, pady=8,
+                                    font=F["mono"], insertbackground=C["accent"])
+        log_vsb = ttk.Scrollbar(lcard.body, orient=tk.VERTICAL,
+                                style="Slim.Vertical.TScrollbar",
+                                command=self.contacts_log.yview)
+        self.contacts_log.configure(yscrollcommand=log_vsb.set)
+        log_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.contacts_log.pack(fill=tk.BOTH, expand=True)
         self.contacts_log.config(state=tk.DISABLED)
-
-        # 同时将contacts_log设置为export_log，以便在导出时使用
         self.export_log = self.contacts_log
+        self.vlist._empty_text = "点击上方「加载联系人」开始"
+
+    def _build_time_range(self, parent):
+        """日期 + 时分秒选择（日历按需弹出，启动不加载 tkcalendar 样式）"""
+        C, F = self.C, self.F
+        for i, (label, year, month, day, hh, mm, ss) in enumerate((
+                ("开始", 2020, 1, 1, "00", "00", "00"),
+                ("结束", 2035, 12, 31, "23", "59", "59"))):
+            row = tk.Frame(parent, bg=C["surface"])
+            row.pack(fill=tk.X, pady=2)
+            tk.Label(row, text=label, bg=C["surface"], fg=C["faint"],
+                     font=F["tiny"], width=3).pack(side=tk.LEFT)
+            entry = ui_kit.DateField(row, year=year, month=month, day=day,
+                                     width=11, bg=C["surface"])
+            entry.pack(side=tk.LEFT)
+            setattr(self, "start_date_entry" if i == 0 else "end_date_entry", entry)
+
+            for which, val in (("hour", hh), ("minute", mm), ("second", ss)):
+                if which != "hour":
+                    tk.Label(row, text=":", bg=C["surface"], fg=C["faint"],
+                             font=F["tiny"]).pack(side=tk.LEFT)
+                sp = ttk.Spinbox(row, from_=0, to=59 if which != "hour" else 23,
+                                 width=3, format="%02.0f")
+                sp.set(val)
+                sp.pack(side=tk.LEFT)
+                setattr(self, f"{'start' if i == 0 else 'end'}_{which}", sp)
+
+    def _build_message_types(self, parent):
+        """消息类型复选框（4 列紧凑排布）"""
+        self.msg_types = {}
+        values = [
+            ("文本", MessageType.Text),
+            ("图片", MessageType.Image),
+            ("语音", MessageType.Audio),
+            ("视频", MessageType.Video),
+            ("链接", MessageType.LinkMessage),
+            ("表情", MessageType.Emoji),
+            ("文件", MessageType.File),
+            ("系统", MessageType.System),
+            ("引用", MessageType.Quote),
+            ("合并转发", MessageType.MergedMessages),
+            ("全部消息", None),
+        ]
+        for i, (text, value) in enumerate(values):
+            var = tk.BooleanVar(value=(value is None))
+            self.msg_types[value] = var
+            ttk.Checkbutton(parent, text=text, variable=var).grid(
+                row=i // 3, column=i % 3, sticky="w", padx=(0, 10), pady=2)
+
+    def _clear_log(self):
+        self.contacts_log.config(state=tk.NORMAL)
+        self.contacts_log.delete("1.0", tk.END)
+        self.contacts_log.config(state=tk.DISABLED)
 
     def create_export_tab(self):
         """Create the export records tab"""
@@ -719,24 +659,34 @@ class WeChatExportGUI:
         self.export_log.config(state=tk.DISABLED)
 
     def create_weekly_report_tab(self):
-        """创建周报生成标签页"""
-        weekly_report_tab = ttk.Frame(self.notebook, style="WeChat.TFrame")
-        self.notebook.add(weekly_report_tab, text="周报生成")
+        """周报生成：先占位，首次切到时才真正构建（避免启动时发网络请求）"""
+        tab = tk.Frame(self.notebook, bg=self.C["bg"])
+        self.notebook.add(tab, text="周报生成")
+        self._weekly_tab = tab
+        self.weekly_report_frame = None
+        self._weekly_hint = tk.Label(tab, text="首次打开时加载周报模块…",
+                                     bg=self.C["bg"], fg=self.C["faint"],
+                                     font=self.F["small"])
+        self._weekly_hint.pack(pady=40)
 
-        # 创建周报生成界面
+    def _ensure_weekly_built(self):
+        if self.weekly_report_frame is not None or WeeklyReportFrame is None:
+            return
+        try:
+            self._weekly_hint.destroy()
+        except tk.TclError:
+            pass
         self.weekly_report_frame = WeeklyReportFrame(
-            weekly_report_tab,
-            database=None,  # 初始时没有数据库连接
-            contact=None,   # 初始时没有选中联系人
+            self._weekly_tab,
+            database=self.database,
+            contact=self._contact,
             config={
                 "report_api_url": self.config.get("report_api_url", "http://localhost:8000"),
                 "output_dir": self.config.get("output_dir", "./data/")
             }
         )
         self.weekly_report_frame.pack(fill=tk.BOTH, expand=True)
-
-        # 记录日志
-        self.log_message_console("周报生成标签页已创建")
+        ui_kit.theme_tree(self.weekly_report_frame)
 
     def create_settings_tab(self):
         """创建设置标签页，整合解密和导出功能"""
@@ -745,7 +695,7 @@ class WeChatExportGUI:
 
         # 创建左右分栏布局
         paned_window = ttk.PanedWindow(settings_tab, orient=tk.HORIZONTAL)
-        paned_window.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        paned_window.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
 
         # 左侧面板 - 基本设置
         left_panel = ttk.Frame(paned_window, style="WeChat.TFrame")
@@ -817,9 +767,12 @@ class WeChatExportGUI:
         self.recent_db_listbox = tk.Listbox(
             recent_db_frame,
             height=5,
-            font=("微软雅黑", 9),
-            selectbackground="#d4eef9",
-            selectforeground="#000000"
+            font=("Microsoft YaHei UI", 9),
+            bg="#F6F8FA", fg="#424A53",
+            highlightthickness=1, highlightbackground="#D0D7DE",
+            borderwidth=0, activestyle="none",
+            selectbackground="#EAEEF2",
+            selectforeground="#E6EDF7"
         )
         self.recent_db_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.recent_db_listbox.bind('<<ListboxSelect>>', self.on_recent_db_select)
@@ -851,15 +804,20 @@ class WeChatExportGUI:
         log_frame = ttk.LabelFrame(decrypt_frame, text="解密日志", style="WeChat.TLabelframe")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        self.decrypt_log = scrolledtext.ScrolledText(
-            log_frame,
-            wrap=tk.WORD,
-            height=8,
-            font=("微软雅黑", 9),
-            background="#ffffff",
-            borderwidth=0
-        )
-        self.decrypt_log.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        log_box = tk.Frame(log_frame, bg="#F6F8FA")
+        log_box.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.decrypt_log = tk.Text(log_box, wrap=tk.WORD, height=8, width=30,
+                                   font=("Consolas", 9),
+                                   bg="#F6F8FA", fg="#424A53",
+                                   insertbackground="#2DA44E",
+                                   borderwidth=0, highlightthickness=0,
+                                   padx=10, pady=8)
+        log_vsb = ttk.Scrollbar(log_box, orient=tk.VERTICAL,
+                                style="Slim.Vertical.TScrollbar",
+                                command=self.decrypt_log.yview)
+        self.decrypt_log.configure(yscrollcommand=log_vsb.set)
+        log_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.decrypt_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.decrypt_log.config(state=tk.DISABLED)
 
         # 历史解密记录区域
@@ -870,9 +828,12 @@ class WeChatExportGUI:
         self.decrypt_history_listbox = tk.Listbox(
             history_frame,
             height=5,
-            font=("微软雅黑", 9),
-            selectbackground="#d4eef9",
-            selectforeground="#000000"
+            font=("Microsoft YaHei UI", 9),
+            bg="#F6F8FA", fg="#424A53",
+            highlightthickness=1, highlightbackground="#D0D7DE",
+            borderwidth=0, activestyle="none",
+            selectbackground="#EAEEF2",
+            selectforeground="#E6EDF7"
         )
         self.decrypt_history_listbox.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
         self.decrypt_history_listbox.bind('<<ListboxSelect>>', self.on_decrypt_history_select)
@@ -1118,398 +1079,233 @@ class WeChatExportGUI:
             if self.load_button:
                 self.root.after(0, lambda: self.load_button.config(state=tk.NORMAL, text="加载联系人"))
 
+    @staticmethod
+    def _contact_kind(contact):
+        """返回 (分组名, 头像类型)"""
+        if getattr(contact, 'type', None) == 'star':
+            return "星标联系人", "star"
+        if getattr(contact, 'wxid', '').startswith('gh_'):
+            return "公众号", "oa"
+        if getattr(contact, 'is_chatroom', False):
+            return "群聊", "group"
+        return "好友", "friend"
+
     def _update_contacts_list(self):
-        """Update the contacts listbox with performance optimizations"""
-        self.log_message(self.contacts_log, "开始更新联系人列表UI...")
-
-        # 检查 contacts_frame 是否存在
-        if not hasattr(self, 'contacts_frame') or self.contacts_frame is None:
-            self.log_message(self.contacts_log, "错误: contacts_frame 不存在或为 None")
+        """重建行模型并交给虚拟列表渲染（只画可视行，不影响滚动帧率）"""
+        if not getattr(self, "vlist", None):
             return
 
-        # 清除现有的联系人列表
-        try:
-            # 删除所有现有的联系人项目
-            for widget in self.contacts_frame.winfo_children():
-                widget.destroy()
-        except Exception as e:
-            self.log_message(self.contacts_log, f"清除联系人列表出错: {str(e)}")
+        # 让在途头像任务失效，避免搜索后回填到错误的行
+        self._avatar_gen += 1
+        with self._avatar_todo.mutex:
+            self._avatar_todo.queue.clear()
+        self._avatar_pending.clear()
 
-        if not self.filtered_contacts:
-            self.log_message(self.contacts_log, "警告: filtered_contacts 为空")
+        groups = {"星标联系人": [], "好友": [], "群聊": [], "公众号": []}
+        for contact in self.filtered_contacts:
+            groups[self._contact_kind(contact)[0]].append(contact)
+
+        tag_map = {"star": "星标", "oa": "公众号", "group": "群聊", "friend": "好友"}
+        rows = []
+        for name, items in groups.items():
+            if not items:
+                continue
+            rows.append({"kind": "header", "title": name, "count": len(items)})
+            for contact in items:
+                kind = self._contact_kind(contact)[1]
+                rows.append({
+                    "kind": "item",
+                    "contact": contact,
+                    "tag": tag_map.get(kind, "好友"),
+                    "badge": "★" if kind == "star" else None,
+                })
+
+        self.vlist._selected = None
+        self.vlist.set_rows(rows)
+        self._update_stats()
+        if hasattr(self, "status_right"):
+            self.status_right.set(
+                f"共 {len(self.contacts)} 位联系人 · 当前显示 {len(self.filtered_contacts)} 位")
+
+    def _update_stats(self):
+        """只刷新统计数字，不重建控件"""
+        if not getattr(self, "_stat_vars", None):
             return
+        counts = {"好友": 0, "群聊": 0, "公众号": 0, "星标": 0}
+        for c in self.contacts:
+            kind = self._contact_kind(c)[1]
+            counts[{"friend": "好友", "group": "群聊",
+                    "oa": "公众号", "star": "星标"}[kind]] += 1
+        for name, var in self._stat_vars.items():
+            var.set(str(counts.get(name, 0)))
 
-        try:
-            self.log_message(self.contacts_log, f"开始添加 {len(self.filtered_contacts)} 个联系人到列表")
+    def _on_contact_select(self, contact):
+        """列表选中回调"""
+        self._contact = contact
+        self.selected_wxid.set(getattr(contact, "wxid", ""))
 
-            # 按类型对联系人分组
-            groups = {
-                "星标联系人": [],
-                "公众号": [],
-                "群聊": [],
-                "好友": []
-            }
+        nickname = getattr(contact, "nickname", "") or ""
+        remark = getattr(contact, "remark", "") or ""
+        display = f"{remark}（{nickname}）" if remark and nickname else (remark or nickname or "未知联系人")
+        self.detail_name.config(text=display)
+        self.detail_wxid.config(text=getattr(contact, "wxid", ""))
+        self.detail_badge.config(text=self._contact_kind(contact)[0])
+        self.detail_badge.pack(side=tk.RIGHT)
 
-            for contact in self.filtered_contacts:
-                if hasattr(contact, 'type') and contact.type == 'star':
-                    groups["星标联系人"].append(contact)
-                elif hasattr(contact, 'wxid') and contact.wxid.startswith('gh_'):
-                    groups["公众号"].append(contact)
-                elif hasattr(contact, 'is_chatroom') and contact.is_chatroom:
-                    groups["群聊"].append(contact)
-                else:
-                    groups["好友"].append(contact)
-
-            # 创建一个装载所有要创建的联系人项目信息的列表
-            # 延迟创建实际的UI组件，以减少UI事件循环的压力
-            items_to_create = []
-            for group_name, contacts in groups.items():
-                if contacts:
-                    # 添加分组标题
-                    items_to_create.append({
-                        'type': 'group',
-                        'text': f"--- {group_name} ({len(contacts)}) ---",
-                    })
-
-                    # 只添加前100个联系人，超过后添加"加载更多"按钮
-                    MAX_INITIAL_CONTACTS = 100
-
-                    # 添加该分组的联系人
-                    for i, contact in enumerate(contacts[:MAX_INITIAL_CONTACTS]):
-                        items_to_create.append({
-                            'type': 'contact',
-                            'contact': contact,
-                            'position': i
-                        })
-
-                    # 如果超过限制，添加"加载更多"按钮
-                    if len(contacts) > MAX_INITIAL_CONTACTS:
-                        items_to_create.append({
-                            'type': 'load_more',
-                            'group': group_name,
-                            'contacts': contacts[MAX_INITIAL_CONTACTS:],
-                            'start_index': MAX_INITIAL_CONTACTS
-                        })
-
-            # 一次性创建所有UI组件，减少重绘次数
-            self.root.update_idletasks()  # 刷新界面，避免卡顿感
-
-            total_added = 0
-            for item in items_to_create:
-                if item['type'] == 'group':
-                    # 创建分组标题
-                    group_label = ttk.Label(
-                        self.contacts_frame,
-                        text=item['text'],
-                        style="WeChat.TLabel",
-                        background="#f0f0f0",
-                        foreground="#888888"
-                    )
-                    group_label.pack(fill=tk.X, pady=(10, 5), padx=5)
-
-                elif item['type'] == 'contact':
-                    # 创建联系人项目
-                    self._create_contact_item(item['contact'])
-                    total_added += 1
-
-                elif item['type'] == 'load_more':
-                    # 创建"加载更多"按钮
-                    load_more_frame = ttk.Frame(self.contacts_frame, style="Contact.TFrame")
-                    load_more_frame.pack(fill=tk.X, pady=2, padx=5)
-
-                    load_more_btn = ttk.Button(
-                        load_more_frame,
-                        text=f"加载更多 {item['group']} ({len(item['contacts'])}个)",
-                        command=lambda g=item['group'], c=item['contacts']: self._load_more_contacts(g, c)
-                    )
-                    load_more_btn.pack(fill=tk.X, pady=2)
-
-                # 每创建10个项目就更新一次界面，平衡性能和响应性
-                if total_added % 10 == 0:
-                    self.root.update_idletasks()
-
-            self.log_message(self.contacts_log, f"联系人列表更新完成，添加了 {total_added} 个联系人")
-        except Exception as e:
-            self.log_message(self.contacts_log, f"更新联系人列表时出错: {str(e)}")
-            self.log_message(self.contacts_log, traceback.format_exc())
-
-    def _create_contact_item(self, contact):
-        """创建单个联系人项目，单独提取为方法以便重用"""
-        try:
-            # 使用缓存检查是否已经加载过此联系人的头像
-            avatar_key = f"avatar_{contact.wxid}"
-
-            # 创建联系人项目框架
-            contact_frame = ttk.Frame(self.contacts_frame, style="Contact.TFrame")
-            contact_frame.pack(fill=tk.X, pady=2, padx=5)
-
-            # 创建头像容器（固定大小）
-            avatar_container = ttk.Frame(contact_frame, style="Contact.TFrame", width=32, height=32)
-            avatar_container.pack(side=tk.LEFT, padx=(5, 10))
-            avatar_container.pack_propagate(False)  # 保持固定大小
-
-            # 确定默认头像类型
-            if hasattr(contact, 'is_chatroom') and contact.is_chatroom:
-                avatar_text = "👥"  # 群聊图标
-            elif hasattr(contact, 'wxid') and contact.wxid.startswith('gh_'):
-                avatar_text = "📢"  # 公众号图标
-            else:
-                avatar_text = "👤"  # 普通联系人图标
-
-            # 创建头像标签
-            avatar_label = ttk.Label(
-                avatar_container,
-                text=avatar_text,
-                font=("Arial", 16),
-                style="Contact.TLabel",
-                anchor=tk.CENTER
-            )
-            avatar_label.pack(fill=tk.BOTH, expand=True)
-
-            # 获取显示名称
-            display_name = contact.nickname if hasattr(contact, 'nickname') and contact.nickname else "未知"
-            if hasattr(contact, 'remark') and contact.remark:
-                display_name = f"{contact.remark} ({contact.nickname})"
-
-            # 创建联系人名称标签
-            name_label = ttk.Label(
-                contact_frame,
-                text=display_name,
-                style="Contact.TLabel"
-            )
-            name_label.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor=tk.W)
-
-            # 异步加载头像（不阻塞UI线程）
-            if hasattr(self, 'contact_avatar_cache') and avatar_key in self.contact_avatar_cache:
-                # 从缓存中使用头像
-                photo = self.contact_avatar_cache[avatar_key]
-                if photo:
-                    avatar_label.config(image=photo, text='')
-                    avatar_label.image = photo
-            elif self.database:
-                # 在新线程中加载头像
-                threading.Thread(
-                    target=self._load_contact_avatar_thread,
-                    args=(contact, avatar_label),
-                    daemon=True
-                ).start()
-
-            # 绑定点击事件
-            contact_frame.bind("<Button-1>", lambda e, c=contact: self._on_contact_item_select(c))
-            avatar_label.bind("<Button-1>", lambda e, c=contact: self._on_contact_item_select(c))
-            name_label.bind("<Button-1>", lambda e, c=contact: self._on_contact_item_select(c))
-
-            # 添加悬停效果
-            contact_frame.bind("<Enter>", lambda e, frame=contact_frame: self._on_contact_hover_enter(frame))
-            contact_frame.bind("<Leave>", lambda e, frame=contact_frame: self._on_contact_hover_leave(frame))
-
-        except Exception as e:
-            self.log_message(self.contacts_log, f"创建联系人项目时出错: {str(e)}")
-
-    def _load_more_contacts(self, group_name, remaining_contacts):
-        """加载更多联系人"""
-        # 每次加载的联系人数量
-        BATCH_SIZE = 50
-
-        contacts_to_load = remaining_contacts[:BATCH_SIZE]
-        for contact in contacts_to_load:
-            self._create_contact_item(contact)
-
-        # 更新界面
-        self.root.update_idletasks()
-
-        # 若还有剩余，添加新的"加载更多"按钮
-        if len(remaining_contacts) > BATCH_SIZE:
-            load_more_frame = ttk.Frame(self.contacts_frame, style="Contact.TFrame")
-            load_more_frame.pack(fill=tk.X, pady=2, padx=5)
-
-            load_more_btn = ttk.Button(
-                load_more_frame,
-                text=f"加载更多 {group_name} ({len(remaining_contacts) - BATCH_SIZE}个)",
-                command=lambda g=group_name, c=remaining_contacts[BATCH_SIZE:]: self._load_more_contacts(g, c)
-            )
-            load_more_btn.pack(fill=tk.X, pady=2)
-
-    def _load_contact_avatar_thread(self, contact, avatar_label):
-        """在后台线程中加载联系人头像"""
-        try:
-            # 初始化头像缓存字典（如果尚未初始化）
-            if not hasattr(self, 'contact_avatar_cache'):
-                self.contact_avatar_cache = {}
-
-            avatar_key = f"avatar_{contact.wxid}"
-
-            # 获取头像数据
-            avatar_buffer = None
-            try:
-                # 尝试从数据库获取头像
-                if hasattr(self.database, 'get_avatar_buffer'):
-                    avatar_buffer = self.database.get_avatar_buffer(contact.wxid)
-                elif hasattr(self.database, 'get_avatar_urls'):
-                    # 如果头像已经被保存到文件系统
-                    avatar_urls = self.database.get_avatar_urls(contact.wxid)
-                    if avatar_urls and len(avatar_urls) > 0:
-                        # 使用第一个URL
-                        avatar_path = avatar_urls[0]
-                        # 检查文件是否存在
-                        if os.path.exists(avatar_path):
-                            with open(avatar_path, 'rb') as f:
-                                avatar_buffer = f.read()
-            except Exception:
-                # 忽略错误，使用默认头像
-                pass
-
-            # 如果获取到头像数据
-            if avatar_buffer:
-                # 使用PIL处理图像
-                img = Image.open(io.BytesIO(avatar_buffer))
-                # 调整大小为小头像
-                img = img.resize((32, 32), Image.LANCZOS)
-                # 创建Tkinter兼容的图像
-                photo = ImageTk.PhotoImage(img)
-
-                # 保存到缓存中
-                self.contact_avatar_cache[avatar_key] = photo
-
-                # 在主线程更新UI
-                self.root.after(0, lambda: self._update_avatar_label(avatar_label, photo))
-        except Exception as e:
-            # 忽略错误，保持默认头像
-            pass
-
-    def _update_avatar_label(self, label, photo):
-        """在主线程中更新头像标签"""
-        try:
-            if label.winfo_exists():  # 检查标签是否仍然存在
-                label.config(image=photo, text='')
-                # 保存引用以防止垃圾回收
-                label.image = photo
-        except Exception:
-            pass
-
-    def _on_contact_item_select(self, contact):
-        """处理联系人项目被选中的事件"""
-        self.selected_wxid.set(contact.wxid)
         self._update_contact_details(contact)
-        # 尝试加载并显示联系人头像
         self._load_avatar(contact)
 
-        # 如果周报生成标签页存在，更新联系人信息
-        if hasattr(self, 'weekly_report_frame') and self.weekly_report_frame is not None:
-            # 更新周报生成界面的联系人和数据库
+        if hasattr(self, "weekly_report_frame") and self.weekly_report_frame is not None:
             self.weekly_report_frame.contact = contact
             self.weekly_report_frame.database = self.database
-            # 记录日志
-            self.log_message_console(f"已更新周报生成标签页的联系人: {contact.remark}")
+
+    def _ensure_avatar_pipeline(self):
+        """启动唯一的头像 worker 与主线程消费器"""
+        if not self._avatar_worker_started:
+            self._avatar_worker_started = True
+            threading.Thread(target=self._avatar_worker, daemon=True).start()
+        if self._avatar_pump_job is None:
+            self._avatar_pump_job = self.root.after(30, self._pump_avatar_results)
+
+    def _request_avatar(self, wxid):
+        """供虚拟列表调用：只为可见行请求头像"""
+        if not wxid or not self.database:
+            return
+        if (wxid in self.contact_avatar_cache or wxid in self._avatar_pending
+                or wxid in self._avatar_missing):
+            return
+        self._avatar_pending.add(wxid)
+        self._avatar_todo.put((self._avatar_gen, wxid))
+        self._ensure_avatar_pipeline()
+
+    def _avatar_worker(self):
+        while True:
+            gen, wxid = self._avatar_todo.get()
+            try:
+                if gen != self._avatar_gen:
+                    continue
+                buf = None
+                try:
+                    if hasattr(self.database, 'get_avatar_buffer'):
+                        buf = self.database.get_avatar_buffer(wxid)
+                    elif hasattr(self.database, 'get_avatar_urls'):
+                        urls = self.database.get_avatar_urls(wxid)
+                        if urls and os.path.exists(urls[0]):
+                            with open(urls[0], 'rb') as f:
+                                buf = f.read()
+                except Exception:
+                    buf = None
+                if buf:
+                    img = Image.open(io.BytesIO(buf)).convert("RGB")
+                    img = img.resize((36, 36), Image.LANCZOS)
+                    self._avatar_done.put((gen, wxid, img))
+                else:
+                    self._avatar_done.put((gen, wxid, None))
+            except Exception:
+                pass
+            finally:
+                self._avatar_todo.task_done()
+
+    def _pump_avatar_results(self):
+        """每帧最多应用 6 张头像，队列空了就停止轮询"""
+        self._avatar_pump_job = None
+        applied = 0
+        while applied < 6:
+            try:
+                gen, wxid, img = self._avatar_done.get_nowait()
+            except queue.Empty:
+                break
+            if gen != self._avatar_gen:
+                self._avatar_pending.discard(wxid)
+                continue
+            self._avatar_pending.discard(wxid)
+            if img is None:
+                self._avatar_missing.add(wxid)
+                continue
+            try:
+                photo = ImageTk.PhotoImage(img)
+                self.contact_avatar_cache[wxid] = photo
+                self.vlist.set_avatar(wxid, photo)
+                if self._contact is not None and getattr(self._contact, "wxid", "") == wxid:
+                    self.detail_avatar.config(image=photo, text="")
+                    self.detail_avatar.image = photo
+            except Exception:
+                pass
+            applied += 1
+
+        if self._avatar_pending or not self._avatar_done.empty():
+            self._avatar_pump_job = self.root.after(30, self._pump_avatar_results)
 
     def _update_contact_details(self, contact):
-        """更新联系人详情显示"""
-        # 更新联系人详情
-        self.contact_details.config(state=tk.NORMAL)
-        self.contact_details.delete(1.0, tk.END)
+        """联系人详情（暗色富文本）"""
+        t = self.contact_details
+        F = self.F
+        t.config(state=tk.NORMAL)
+        t.delete("1.0", tk.END)
+        t.tag_configure("k", foreground=self.C["muted"], font=F["small"])
+        t.tag_configure("v", foreground=self.C["text"], font=F["small"])
+        t.tag_configure("s", foreground=self.C["accent"], font=F["h2"],
+                        spacing1=6, spacing3=2)
 
-        # 使用更美观的格式显示联系人信息
-        self.contact_details.tag_configure("title", font=("微软雅黑", 10, "bold"))
-        self.contact_details.tag_configure("content", font=("微软雅黑", 9))
-        self.contact_details.tag_configure("section", font=("微软雅黑", 10, "bold"), foreground="#07c160")
+        def line(key, value):
+            t.insert(tk.END, f"{key}  ", "k")
+            t.insert(tk.END, f"{value}\n", "v")
 
-        # 基本信息部分
-        self.contact_details.insert(tk.END, "基本信息\n", "section")
+        t.insert(tk.END, "基本信息\n", "s")
+        line("微信 ID", getattr(contact, "wxid", "") or "-")
+        line("昵称", getattr(contact, "nickname", "") or "-")
+        if getattr(contact, "remark", ""):
+            line("备注", contact.remark)
+        if getattr(contact, "alias", ""):
+            line("别名", contact.alias)
 
-        self.contact_details.insert(tk.END, "微信ID: ", "title")
-        self.contact_details.insert(tk.END, f"{contact.wxid}\n", "content")
-
-        self.contact_details.insert(tk.END, "昵称: ", "title")
-        self.contact_details.insert(tk.END, f"{contact.nickname}\n", "content")
-
-        if hasattr(contact, 'remark') and contact.remark:
-            self.contact_details.insert(tk.END, "备注: ", "title")
-            self.contact_details.insert(tk.END, f"{contact.remark}\n", "content")
-
-        if hasattr(contact, 'alias') and contact.alias:
-            self.contact_details.insert(tk.END, "别名: ", "title")
-            self.contact_details.insert(tk.END, f"{contact.alias}\n", "content")
-
-        # 添加类型信息
-        self.contact_details.insert(tk.END, "\n类型信息\n", "section")
-
-        if hasattr(contact, 'is_chatroom') and contact.is_chatroom:
-            self.contact_details.insert(tk.END, "类型: ", "title")
-            self.contact_details.insert(tk.END, "群聊\n", "content")
-
-            # 获取群成员信息
+        t.insert(tk.END, "\n类型信息\n", "s")
+        kind = self._contact_kind(contact)
+        if getattr(contact, "is_chatroom", False):
+            line("类型", "群聊")
             if self.database:
                 try:
-                    chatroom_members = self.database.get_chatroom_members(contact.wxid)
-                    member_count = len(chatroom_members) if chatroom_members else 0
-
-                    self.contact_details.insert(tk.END, "成员数: ", "title")
-                    self.contact_details.insert(tk.END, f"{member_count}\n", "content")
-
-                    if member_count > 0 and member_count <= 20:  # 限制显示的成员数量
-                        self.contact_details.insert(tk.END, "\n群成员列表: \n", "title")
-                        for i, member in enumerate(chatroom_members[:20]):
-                            member_name = member.nickname
-                            if hasattr(member, 'display_name') and member.display_name:
-                                member_name = member.display_name
-                            self.contact_details.insert(tk.END, f"{i+1}. {member_name}\n", "content")
-
-                        if member_count > 20:
-                            self.contact_details.insert(tk.END, "...(更多)\n", "content")
+                    members = self.database.get_chatroom_members(contact.wxid)
+                    count = len(members) if members else 0
+                    line("成员数", count)
+                    if 0 < count <= 12:
+                        names = []
+                        for member in members[:12]:
+                            names.append(getattr(member, "display_name", None)
+                                         or getattr(member, "nickname", "") or "-")
+                        line("成员", "、".join(names))
                 except Exception as e:
-                    self.log_message(self.contacts_log, f"获取群成员信息时出错: {str(e)}")
-                    self.contact_details.insert(tk.END, "无法获取群成员信息\n", "content")
-        elif hasattr(contact, 'wxid') and contact.wxid.startswith('gh_'):
-            self.contact_details.insert(tk.END, "类型: ", "title")
-            self.contact_details.insert(tk.END, "公众号\n", "content")
+                    line("提示", f"群成员读取失败：{e}")
+        elif getattr(contact, "wxid", "").startswith("gh_"):
+            line("类型", "公众号")
         else:
-            self.contact_details.insert(tk.END, "类型: ", "title")
-            self.contact_details.insert(tk.END, "个人\n", "content")
+            line("类型", "个人")
 
-        # 添加操作提示
-        self.contact_details.insert(tk.END, "\n操作提示\n", "section")
-        self.contact_details.insert(tk.END, "选择此联系人后，可以切换到\"导出记录\"标签页导出聊天记录。\n", "content")
-
-        self.contact_details.config(state=tk.DISABLED)
-
-    def _on_contact_hover_enter(self, frame):
-        """鼠标悬停在联系人项目上的效果"""
-        try:
-            # 对于ttk组件，不能直接设置background，需要使用style
-            frame.configure(style="ContactHover.TFrame")
-            for child in frame.winfo_children():
-                if isinstance(child, ttk.Label):
-                    child.configure(style="ContactHover.TLabel")
-        except Exception as e:
-            # 忽略样式设置错误，不影响功能
-            self.log_message_console(f"设置悬停样式出错: {str(e)}")
-
-    def _on_contact_hover_leave(self, frame):
-        """鼠标离开联系人项目的效果"""
-        try:
-            # 恢复原始样式
-            frame.configure(style="Contact.TFrame")
-            for child in frame.winfo_children():
-                if isinstance(child, ttk.Label):
-                    child.configure(style="Contact.TLabel")
-        except Exception as e:
-            # 忽略样式设置错误，不影响功能
-            self.log_message_console(f"恢复样式出错: {str(e)}")
+        t.config(state=tk.DISABLED)
 
     def filter_contacts(self, *args):
-        """Filter contacts based on search text"""
-        search_text = self.search_text.get().lower()
+        """搜索防抖：连续输入只重建一次列表"""
+        if not hasattr(self, "vlist"):
+            return
+        if self._search_job:
+            try:
+                self.root.after_cancel(self._search_job)
+            except Exception:
+                pass
+        self._search_job = self.root.after(160, self._apply_filter)
 
-        if not search_text:
-            self.filtered_contacts = self.contacts.copy()
+    def _apply_filter(self):
+        self._search_job = None
+        q = self.search_text.get().strip().lower()
+        if not q:
+            self.filtered_contacts = list(self.contacts)
         else:
             self.filtered_contacts = [
-                contact for contact in self.contacts
-                if (search_text in contact.nickname.lower() or
-                    (contact.remark and search_text in contact.remark.lower()) or
-                    search_text in contact.wxid.lower())
+                c for c in self.contacts
+                if q in (getattr(c, 'nickname', '') or "").lower()
+                or q in (getattr(c, 'remark', '') or "").lower()
+                or q in (getattr(c, 'wxid', '') or "").lower()
             ]
-
         self._update_contacts_list()
 
     def start_export(self):
@@ -1641,52 +1437,18 @@ class WeChatExportGUI:
             self.root.after(0, lambda: messagebox.showerror("错误", f"导出过程中出错: {str(e)}"))
 
     def _load_avatar(self, contact):
-        """加载并显示联系人头像"""
-        try:
-            avatar_image = None
-            # 检查数据库是否已经加载
-            if not self.database:
-                return
-
-            # 获取头像数据
-            avatar_buffer = None
-            try:
-                # 尝试从数据库获取头像
-                if hasattr(self.database, 'get_avatar_buffer'):
-                    avatar_buffer = self.database.get_avatar_buffer(contact.wxid)
-                elif hasattr(self.database, 'get_avatar_urls'):
-                    # 如果头像已经被保存到文件系统
-                    avatar_urls = self.database.get_avatar_urls(contact.wxid)
-                    if avatar_urls and len(avatar_urls) > 0:
-                        # 使用第一个URL
-                        avatar_path = avatar_urls[0]
-                        # 检查文件是否存在
-                        if os.path.exists(avatar_path):
-                            with open(avatar_path, 'rb') as f:
-                                avatar_buffer = f.read()
-            except Exception as e:
-                self.log_message(self.contacts_log, f"获取联系人头像时出错: {str(e)}")
-
-            # 如果获取到头像数据
-            if avatar_buffer:
-                try:
-                    # 使用PIL处理图像
-                    img = Image.open(io.BytesIO(avatar_buffer))
-                    # 调整大小为圆形头像
-                    img = img.resize((64, 64), Image.LANCZOS)
-                    # 创建Tkinter兼容的图像
-                    photo = ImageTk.PhotoImage(img)
-
-                    # 更新头像显示
-                    if hasattr(self, 'avatar_label') and self.avatar_label:
-                        self.avatar_label.config(image=photo, text='')
-                        # 保存引用以防止垃圾回收
-                        self.avatar_label.image = photo
-                    self.log_message(self.contacts_log, f"加载联系人 {contact.wxid} 的头像成功")
-                except Exception as e:
-                    self.log_message(self.contacts_log, f"处理联系人头像图像时出错: {str(e)}")
-        except Exception as e:
-            self.log_message(self.contacts_log, f"加载联系人头像时出错: {str(e)}")
+        """详情卡头像：命中缓存直接用，否则先显首字占位、再排队加载"""
+        wxid = getattr(contact, "wxid", "")
+        if not wxid:
+            return
+        photo = self.contact_avatar_cache.get(wxid)
+        if photo:
+            self.detail_avatar.config(image=photo, text="")
+            self.detail_avatar.image = photo
+        else:
+            nick = getattr(contact, "remark", "") or getattr(contact, "nickname", "") or "?"
+            self.detail_avatar.config(image="", text=nick[:1])
+            self._request_avatar(wxid)
 
     def browse_db_dir(self):
         """Browse for database directory"""
@@ -1701,12 +1463,45 @@ class WeChatExportGUI:
             self.output_dir.set(directory)
 
     def log_message(self, log_widget, message):
-        """Add a message to the log widget"""
-        log_widget.config(state=tk.NORMAL)
-        log_widget.insert(tk.END, f"{message}\n")
-        log_widget.see(tk.END)
-        log_widget.config(state=tk.DISABLED)
-        self.root.update_idletasks()
+        """写日志：入队后由主线程合并刷新，可在任意线程调用"""
+        if log_widget is None:
+            return
+        self._log_queue.put((log_widget, str(message)))
+
+    def _start_log_pump(self):
+        if self._log_job is None:
+            self._log_job = self.root.after(120, self._flush_log)
+
+    def _flush_log(self):
+        """批量刷新日志，并把每个控件限制在 2000 行以内"""
+        self._log_job = None
+        pending = {}
+        drained = 0
+        while drained < 120:
+            try:
+                widget, msg = self._log_queue.get_nowait()
+            except queue.Empty:
+                break
+            pending.setdefault(id(widget), (widget, []))[1].append(msg)
+            drained += 1
+
+        for widget, msgs in pending.values():
+            try:
+                if not widget.winfo_exists():
+                    continue
+                at_bottom = widget.yview()[1] > 0.97
+                widget.config(state=tk.NORMAL)
+                widget.insert(tk.END, "\n".join(msgs) + "\n")
+                lines = int(widget.index("end-1c").split(".")[0])
+                if lines > 2500:
+                    widget.delete("1.0", f"{lines - 2000}.0")
+                if at_bottom:
+                    widget.see(tk.END)
+                widget.config(state=tk.DISABLED)
+            except tk.TclError:
+                pass
+
+        self._log_job = self.root.after(150, self._flush_log)
 
     def test_database_connection(self):
         """测试数据库连接"""

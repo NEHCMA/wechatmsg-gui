@@ -161,18 +161,28 @@ class WeeklyReportFrame(ttk.Frame):
         log_frame = ttk.LabelFrame(main_frame, text="操作日志")
         log_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=10, wrap=tk.WORD)
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        log_box = tk.Frame(log_frame, bg="#F6F8FA")
+        log_box.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.log_text = tk.Text(log_box, height=10, wrap=tk.WORD, width=30,
+                                bg="#F6F8FA", fg="#424A53", insertbackground="#2DA44E",
+                                borderwidth=0, highlightthickness=0, padx=10, pady=8)
+        log_vsb = ttk.Scrollbar(log_box, orient=tk.VERTICAL, style="Slim.Vertical.TScrollbar",
+                                command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_vsb.set)
+        log_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 预览区域
         preview_frame = ttk.LabelFrame(main_frame, text="预览")
         preview_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        self.preview_canvas = tk.Canvas(preview_frame, bg="white")
+        self.preview_canvas = tk.Canvas(preview_frame, bg="#F6F8FA", highlightthickness=0)
         self.preview_canvas.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
         # 添加滚动条
-        scrollbar = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL, command=self.preview_canvas.yview)
+        scrollbar = ttk.Scrollbar(preview_frame, orient=tk.VERTICAL,
+                                  style="Slim.Vertical.TScrollbar",
+                                  command=self.preview_canvas.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.preview_canvas.configure(yscrollcommand=scrollbar.set)
 
